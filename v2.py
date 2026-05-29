@@ -1,0 +1,1116 @@
+"""
+Market Access Dashboard — Prior Authorization (PsO) Extraction Pipeline
+=======================================================================
+
+A highly interactive Streamlit dashboard for the `result.csv` produced by the
+PA extraction pipeline. It safely cleans 'NA' strings to real NaNs, coerces the
+numeric columns with `pd.to_numeric(errors='coerce')`, and visualizes the data
+from as many angles as the dataset allows.
+
+Run with:
+    pip install streamlit pandas plotly openpyxl
+    streamlit run market_access_dashboard.py
+
+Use the uploader at the top of the page to load a CSV or Excel file
+(.csv / .xlsx / .xls). If you don't upload anything, the app falls back to a
+local `result.csv` (or `result.xlsx`) in the working directory.
+(`openpyxl` is only required if you upload/read Excel files.)
+
+Expected columns:
+    Filename, Brand, Age, Number_of_Steps_through_Generic,
+    Number_of_Steps_through_Brands, Step_through_Phototherapy, TB_Test_required,
+    Quantity_Limits, Specialist_Types, Initial_Authorization_Duration_months,
+    Reauthorization_Required, Access Score
+"""
+
+from __future__ import annotations
+
+import io
+import re
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+import streamlit as st
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Column groups & schema
+# ─────────────────────────────────────────────────────────────────────────────
+NUMERIC_COLS = [
+    "Number_of_Steps_through_Generic",
+    "Number_of_Steps_through_Brands",
+    "Initial_Authorization_Duration_months",
+    "Access Score",
+]
+# Yes / No / NA flag columns
+YESNO_COLS = [
+    "Step_through_Phototherapy",
+    "TB_Test_required",
+    "Quantity_Limits",
+    "Reauthorization_Required",
+]
+TEXT_COLS = ["Filename", "Brand", "Age", "Specialist_Types"]
+
+EXPECTED_COLS = TEXT_COLS + NUMERIC_COLS + YESNO_COLS
+
+# Friendly labels for the flag columns
+YESNO_LABELS = {
+    "Step_through_Phototherapy": "Phototherapy Step",
+    "TB_Test_required": "TB Test Required",
+    "Quantity_Limits": "Quantity Limits",
+    "Reauthorization_Required": "Reauthorization Required",
+}
+
+# Values that should be treated as missing
+NA_LIKE = {"na", "n/a", "nan", "none", "null", "", "-", "--", "n.a.", "not specified"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aesthetic system  —  "editorial analytics"
+#   Fraunces (display serif) + IBM Plex Sans/Mono, warm off-white, deep teal.
+# ─────────────────────────────────────────────────────────────────────────────
+INK = "#23211C"          # warm near-black text
+SUBTLE = "#6F6A5E"       # muted label text
+ACCENT = "#0F766E"       # deep teal (primary)
+ACCENT_SOFT = "#5EAFA6"  # lighter teal
+ACCENT2 = "#B45309"      # burnt amber (secondary)
+PAPER = "#FBFAF6"        # app background
+CARD = "#FFFFFF"
+LINE = "#E9E3D6"         # hairlines / gridlines
+GRID = "#EFEADD"
+
+# A curated qualitative palette that harmonizes with the teal accent.
+PALETTE = [
+    "#0F766E", "#B45309", "#1D6A96", "#7C6BAE", "#C2557A",
+    "#3F8F5B", "#9A7B2E", "#4C5C9B", "#A8553E", "#5E8C7D",
+]
+
+FONT_BODY = "IBM Plex Sans, -apple-system, Segoe UI, sans-serif"
+FONT_MONO = "IBM Plex Mono, ui-monospace, monospace"
+
+DONUT_COLORS = {"Yes": ACCENT, "No": "#C9C2B2", "Not specified": "#ECE7DA"}
+
+
+def install_plotly_theme() -> None:
+    """Register and activate a cohesive Plotly template."""
+    tpl = go.layout.Template()
+    tpl.layout = go.Layout(
+        font=dict(family=FONT_BODY, color=INK, size=13),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        colorway=PALETTE,
+        title=dict(font=dict(family="Fraunces, Georgia, serif", size=18, color=INK), x=0.0, xanchor="left"),
+        margin=dict(l=10, r=10, t=56, b=10),
+        xaxis=dict(gridcolor=GRID, zerolinecolor=GRID, linecolor=LINE, tickcolor=LINE,
+                   title_font=dict(size=12, color=SUBTLE), tickfont=dict(size=11, color=SUBTLE)),
+        yaxis=dict(gridcolor=GRID, zerolinecolor=GRID, linecolor=LINE,
+                   title_font=dict(size=12, color=SUBTLE), tickfont=dict(size=11, color=SUBTLE)),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=11, color=SUBTLE)),
+        hoverlabel=dict(bgcolor=CARD, bordercolor=LINE, font=dict(family=FONT_BODY, size=12, color=INK)),
+        colorscale=dict(sequential="Viridis"),
+    )
+    pio.templates["macc"] = tpl
+    pio.templates.default = "macc"
+
+
+CSS = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {{
+  --ink: {INK}; --subtle: {SUBTLE}; --accent: {ACCENT}; --accent2: {ACCENT2};
+  --paper: {PAPER}; --card: {CARD}; --line: {LINE};
+}}
+
+.stApp {{
+  background:
+    radial-gradient(1200px 600px at 12% -8%, #FFFDF8 0%, rgba(255,253,248,0) 60%),
+    linear-gradient(180deg, {PAPER} 0%, #F4F1E8 100%);
+  color: var(--ink);
+  font-family: {FONT_BODY};
+}}
+
+.block-container {{ padding-top: 1.6rem; padding-bottom: 4rem; max-width: 1500px; }}
+
+/* Headings */
+h1, h2, h3 {{ font-family: 'Fraunces', Georgia, serif !important; color: var(--ink); letter-spacing: -0.01em; }}
+
+/* Hero */
+.macc-hero {{
+  border: 1px solid var(--line); border-radius: 18px; padding: 26px 30px;
+  background: linear-gradient(135deg, #FFFFFF 0%, #FBF8F1 100%);
+  box-shadow: 0 1px 0 rgba(35,33,28,.03), 0 20px 40px -28px rgba(35,33,28,.25);
+  position: relative; overflow: hidden;
+}}
+.macc-hero:before {{
+  content: ""; position: absolute; right: -60px; top: -60px; width: 260px; height: 260px;
+  background: radial-gradient(circle, rgba(15,118,110,.14), rgba(15,118,110,0) 70%);
+}}
+.macc-hero h1 {{ font-size: 2.35rem; font-weight: 600; margin: 4px 0 6px 0; line-height: 1.05; }}
+.macc-hero .sub {{ color: var(--subtle); font-size: 1.02rem; max-width: 60ch; }}
+.macc-eyebrow {{ font-family: {FONT_MONO}; text-transform: uppercase; letter-spacing: .22em;
+  font-size: .72rem; color: var(--accent); font-weight: 600; }}
+.macc-tags {{ margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }}
+.macc-tag {{ font-family: {FONT_MONO}; font-size: .72rem; color: var(--subtle);
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px; background: #FFFFFFcc; }}
+
+/* Section headers */
+.macc-section {{ margin: 30px 0 6px 0; }}
+.macc-section .macc-eyebrow {{ color: var(--accent2); }}
+.macc-section h2 {{ font-size: 1.5rem; font-weight: 600; margin: 2px 0 2px 0; }}
+.macc-section .desc {{ color: var(--subtle); font-size: .92rem; margin-bottom: 4px; }}
+.macc-rule {{ height: 2px; width: 56px; background: linear-gradient(90deg, var(--accent), transparent);
+  border-radius: 2px; margin-top: 8px; }}
+
+/* Metric cards */
+[data-testid="stMetric"] {{
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 16px 18px 14px 18px;
+  box-shadow: 0 1px 0 rgba(35,33,28,.02), 0 16px 30px -26px rgba(35,33,28,.35);
+  transition: transform .15s ease, box-shadow .15s ease;
+}}
+[data-testid="stMetric"]:hover {{ transform: translateY(-2px);
+  box-shadow: 0 20px 34px -24px rgba(15,118,110,.45); }}
+[data-testid="stMetricLabel"] {{ color: var(--subtle); font-weight: 500; }}
+[data-testid="stMetricLabel"] p {{ font-size: .82rem; letter-spacing: .01em; }}
+[data-testid="stMetricValue"] {{ font-family: {FONT_MONO}; font-weight: 600;
+  color: var(--ink); font-size: 1.9rem; }}
+[data-testid="stMetricDelta"] {{ font-family: {FONT_MONO}; font-size: .78rem; }}
+
+/* Expanders & containers */
+[data-testid="stExpander"] {{ border: 1px solid var(--line); border-radius: 14px;
+  background: #FFFFFFcc; overflow: hidden; }}
+[data-testid="stExpander"] summary {{ font-family: 'Fraunces', serif; font-size: 1.02rem; }}
+
+/* Sidebar */
+[data-testid="stSidebar"] {{ background: #FFFEFB; border-right: 1px solid var(--line); }}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{ font-size: 1.05rem; }}
+
+/* Hide default chrome for a cleaner canvas */
+#MainMenu {{ visibility: hidden; }}
+footer {{ visibility: hidden; }}
+[data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
+
+/* Plotly card framing */
+[data-testid="stPlotlyChart"] {{
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 8px 8px 2px 8px;
+  box-shadow: 0 16px 30px -28px rgba(35,33,28,.4);
+}}
+.macc-caption {{ color: var(--subtle); font-size: .8rem; font-style: italic; margin: -2px 0 6px 2px; }}
+</style>
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Small formatting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def safe_mean(s: pd.Series) -> float:
+    v = pd.to_numeric(s, errors="coerce").dropna()
+    return float(v.mean()) if len(v) else np.nan
+
+
+def safe_median(s: pd.Series) -> float:
+    v = pd.to_numeric(s, errors="coerce").dropna()
+    return float(v.median()) if len(v) else np.nan
+
+
+def fmt_num(x: float, dec: int = 1) -> str:
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{dec}f}"
+
+
+def fmt_pct(x: float) -> str:
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.1f}%"
+
+
+def delta_str(filtered: float, overall: float, pct: bool = False) -> str | None:
+    if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in (filtered, overall)):
+        return None
+    d = filtered - overall
+    return f"{d:+.1f}%" if pct else f"{d:+.1f}"
+
+
+def yes_fraction(series: pd.Series) -> tuple[float, int, int]:
+    """Return (pct_yes, n_yes, n_total) over non-null Yes/No responses."""
+    s = series.dropna()
+    s = s[s.isin(["Yes", "No"])]
+    total = int(len(s))
+    n_yes = int((s == "Yes").sum())
+    pct = (n_yes / total * 100) if total else np.nan
+    return pct, n_yes, total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading & cleaning
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_yesno(series: pd.Series) -> pd.Series:
+    """Map free-text yes/no flags to a clean {'Yes','No', NaN} categorical."""
+    yes = {"yes", "y", "true", "1", "required", "positive"}
+    no = {"no", "n", "false", "0", "not required", "negative"}
+
+    def _map(v):
+        if pd.isna(v):
+            return np.nan
+        t = str(v).strip().lower()
+        if t in NA_LIKE:
+            return np.nan
+        if t in yes:
+            return "Yes"
+        if t in no:
+            return "No"
+        return str(v).strip().title()  # keep any unexpected label, tidied
+
+    return series.map(_map)
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Safely clean the raw pipeline output into typed, analysis-ready columns."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Make sure every expected column exists (degrade gracefully if not).
+    for col in EXPECTED_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # 1) Blank out NA-like tokens across all columns. The str-guard makes this a
+    #    no-op on genuinely numeric cells, and it is robust to pandas 3.x string
+    #    dtypes (which select_dtypes('object') can miss).
+    for c in df.columns:
+        df[c] = df[c].map(
+            lambda v: np.nan if (isinstance(v, str) and v.strip().lower() in NA_LIKE) else v
+        )
+
+    # 2) Coerce numeric columns -> real numbers (NA -> NaN).
+    for c in NUMERIC_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 3) Normalize Yes/No flag columns.
+    for c in YESNO_COLS:
+        df[c] = normalize_yesno(df[c])
+
+    # 4) Tidy text columns.
+    for c in ["Filename", "Brand", "Age", "Specialist_Types"]:
+        df[c] = df[c].map(lambda v: str(v).strip() if isinstance(v, str) else v)
+    df["Brand"] = df["Brand"].map(lambda v: v.upper() if isinstance(v, str) else v)
+
+    # 5) Convenience derived field: total step-therapy steps (row-wise).
+    df["Total_Steps"] = (
+        df["Number_of_Steps_through_Generic"].fillna(0)
+        + df["Number_of_Steps_through_Brands"].fillna(0)
+    )
+    # Mark rows where both step counts were missing so we don't read 0 as real.
+    both_missing = (
+        df["Number_of_Steps_through_Generic"].isna()
+        & df["Number_of_Steps_through_Brands"].isna()
+    )
+    df.loc[both_missing, "Total_Steps"] = np.nan
+
+    return df
+
+
+def _read_table_bytes(data: bytes, filename: str) -> pd.DataFrame:
+    """Read uploaded bytes as CSV or Excel, chosen by file extension."""
+    name = (filename or "").lower()
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        try:
+            return pd.read_excel(io.BytesIO(data))
+        except ImportError as exc:  # openpyxl / xlrd not installed
+            raise ImportError(
+                "Reading Excel files needs the 'openpyxl' package "
+                "(install with: pip install openpyxl)."
+            ) from exc
+    return pd.read_csv(io.BytesIO(data))
+
+
+def _read_table_path(path: str) -> pd.DataFrame:
+    """Read a local file as CSV or Excel, chosen by file extension."""
+    p = path.lower()
+    if p.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_and_clean_from_bytes(data: bytes, filename: str) -> pd.DataFrame:
+    return clean_data(_read_table_bytes(data, filename))
+
+
+@st.cache_data(show_spinner=False)
+def load_and_clean_from_path(path: str) -> pd.DataFrame:
+    return clean_data(_read_table_path(path))
+
+
+def find_local_data() -> str | None:
+    """Look for a local result file (CSV or Excel) to use as a fallback source."""
+    import os
+
+    for candidate in ("result.csv", "result.xlsx", "result.xlsm", "result.xls"):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+SPLIT_RE = re.compile(r"\s*(?:[,;/|]|\band\b|\bor\b|&|\+)\s*", flags=re.IGNORECASE)
+
+
+def row_specialists(value) -> list[str]:
+    """Split a (possibly multi-valued) Specialist_Types cell into clean tokens."""
+    if pd.isna(value):
+        return []
+    parts = SPLIT_RE.split(str(value))
+    out = []
+    for p in parts:
+        t = p.strip().title()
+        if t and t.lower() not in NA_LIKE:
+            out.append(t)
+    return out
+
+
+def specialist_long(df: pd.DataFrame) -> pd.DataFrame:
+    """Explode Specialist_Types into one row per (policy, specialist)."""
+    rows = []
+    for _, r in df.iterrows():
+        for sp in row_specialists(r.get("Specialist_Types")):
+            rows.append(
+                {
+                    "Filename": r.get("Filename"),
+                    "Brand": r.get("Brand"),
+                    "Specialist": sp,
+                    "Access Score": r.get("Access Score"),
+                }
+            )
+    return pd.DataFrame(rows, columns=["Filename", "Brand", "Specialist", "Access Score"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure builders  (each returns a Plotly figure; all are empty-data safe)
+# ─────────────────────────────────────────────────────────────────────────────
+def _empty_fig(msg: str = "No data for the current filters") -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(text=msg, showarrow=False, font=dict(size=14, color=SUBTLE))
+    fig.update_layout(height=320, xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def _style(fig: go.Figure, height: int = 380, legend_bottom: bool = False) -> go.Figure:
+    fig.update_layout(height=height)
+    if legend_bottom:
+        fig.update_layout(
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+    return fig
+
+
+def build_score_by_brand(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Access Score"])
+    if d.empty:
+        return _empty_fig()
+    g = (
+        d.groupby("Brand")
+        .agg(avg_score=("Access Score", "mean"), n=("Access Score", "size"))
+        .reset_index()
+        .sort_values("avg_score", ascending=False)
+    )
+    fig = px.bar(
+        g, x="avg_score", y="Brand", orientation="h",
+        color="avg_score", color_continuous_scale="Viridis",
+        custom_data=["n"], title="Average Access Score by Brand",
+        labels={"avg_score": "Avg Access Score", "Brand": ""},
+    )
+    fig.update_traces(
+        hovertemplate="<b>%{y}</b><br>Avg Access Score: %{x:.2f}<br>Policies: %{customdata[0]}<extra></extra>"
+    )
+    fig.update_layout(yaxis=dict(categoryorder="total ascending"),
+                      coloraxis_colorbar=dict(title="Score"))
+    return _style(fig, height=max(360, 26 * len(g) + 120))
+
+
+def build_score_distribution(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Access Score"])
+    if d.empty:
+        return _empty_fig()
+    fig = px.histogram(
+        d, x="Access Score", nbins=24, marginal="box",
+        color_discrete_sequence=[ACCENT], title="Distribution of Access Scores",
+        labels={"Access Score": "Access Score"},
+    )
+    mean_v = d["Access Score"].mean()
+    fig.add_vline(x=mean_v, line_dash="dash", line_color=ACCENT2,
+                  annotation_text=f"mean {mean_v:.1f}", annotation_position="top")
+    fig.update_layout(bargap=0.06, yaxis_title="Policies")
+    return _style(fig, height=380)
+
+
+def build_score_box_by_brand(df: pd.DataFrame, top_n: int = 12) -> go.Figure:
+    d = df.dropna(subset=["Access Score"])
+    if d.empty:
+        return _empty_fig()
+    top = d["Brand"].value_counts().head(top_n).index
+    d = d[d["Brand"].isin(top)]
+    order = d.groupby("Brand")["Access Score"].median().sort_values(ascending=False).index
+    fig = px.box(
+        d, x="Brand", y="Access Score", color="Brand", points="all",
+        category_orders={"Brand": list(order)},
+        hover_data=["Filename"], title=f"Access Score Spread by Brand (top {len(top)})",
+        color_discrete_sequence=PALETTE,
+    )
+    fig.update_layout(showlegend=False, xaxis_title="", xaxis_tickangle=-30)
+    return _style(fig, height=420)
+
+
+def build_friction_scatter(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Number_of_Steps_through_Generic", "Number_of_Steps_through_Brands"]).copy()
+    if d.empty:
+        return _empty_fig()
+    rng = np.random.default_rng(7)
+    d["gx"] = d["Number_of_Steps_through_Generic"] + rng.uniform(-0.16, 0.16, len(d))
+    d["by"] = d["Number_of_Steps_through_Brands"] + rng.uniform(-0.16, 0.16, len(d))
+    d["size"] = d["Total_Steps"].fillna(1).clip(lower=1)
+    fig = px.scatter(
+        d, x="gx", y="by", color="Access Score", size="size",
+        color_continuous_scale="Plasma", size_max=20,
+        custom_data=["Filename", "Brand", "Number_of_Steps_through_Generic",
+                     "Number_of_Steps_through_Brands", "Access Score"],
+        title="Step-Therapy Friction — Generic vs Brand Steps",
+        labels={"gx": "Generic Steps", "by": "Brand Steps"},
+    )
+    fig.update_traces(
+        marker=dict(line=dict(width=0.5, color="white")),
+        hovertemplate=("<b>%{customdata[1]}</b> — %{customdata[0]}<br>"
+                       "Generic steps: %{customdata[2]}<br>Brand steps: %{customdata[3]}<br>"
+                       "Access Score: %{customdata[4]:.1f}<extra></extra>"),
+    )
+    lim = float(np.nanmax([d["Number_of_Steps_through_Generic"].max(),
+                           d["Number_of_Steps_through_Brands"].max(), 1])) + 0.6
+    fig.add_shape(type="line", x0=0, y0=0, x1=lim, y1=lim,
+                  line=dict(color=LINE, width=1, dash="dot"))
+    fig.add_annotation(x=lim * 0.82, y=lim * 0.9, text="balanced", showarrow=False,
+                       font=dict(color=SUBTLE, size=10))
+    fig.update_layout(coloraxis_colorbar=dict(title="Score"))
+    return _style(fig, height=420)
+
+
+def build_friction_density(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Number_of_Steps_through_Generic", "Number_of_Steps_through_Brands"])
+    if d.empty:
+        return _empty_fig()
+    fig = px.density_heatmap(
+        d, x="Number_of_Steps_through_Generic", y="Number_of_Steps_through_Brands",
+        color_continuous_scale="Viridis", text_auto=True,
+        title="Friction Density — Policy Counts",
+        labels={"Number_of_Steps_through_Generic": "Generic Steps",
+                "Number_of_Steps_through_Brands": "Brand Steps"},
+    )
+    fig.update_layout(coloraxis_colorbar=dict(title="Policies"))
+    return _style(fig, height=420)
+
+
+def build_steps_by_brand(df: pd.DataFrame, top_n: int = 12) -> go.Figure:
+    if df.empty:
+        return _empty_fig()
+    top = df["Brand"].value_counts().head(top_n).index
+    d = df[df["Brand"].isin(top)]
+    g = d.groupby("Brand").agg(
+        Generic=("Number_of_Steps_through_Generic", "mean"),
+        Branded=("Number_of_Steps_through_Brands", "mean"),
+    ).reset_index()
+    g["__tot"] = g["Generic"].fillna(0) + g["Branded"].fillna(0)
+    g = g.sort_values("__tot", ascending=False).drop(columns="__tot")
+    mlt = g.melt(id_vars="Brand", value_vars=["Generic", "Branded"],
+                 var_name="Step Type", value_name="Avg Steps")
+    mlt["Step Type"] = mlt["Step Type"].map({"Generic": "Generic", "Branded": "Brand"})
+    fig = px.bar(
+        mlt, x="Brand", y="Avg Steps", color="Step Type", barmode="group",
+        color_discrete_map={"Generic": ACCENT2, "Brand": ACCENT},
+        title=f"Average Step Count by Brand (top {len(top)})",
+    )
+    fig.update_layout(xaxis_title="", xaxis_tickangle=-30, legend_title_text="")
+    return _style(fig, height=420, legend_bottom=True)
+
+
+def build_requirement_donut(df: pd.DataFrame, col: str) -> go.Figure:
+    s = df[col].copy()
+    s = s.where(s.isin(["Yes", "No"]), other=np.nan)
+    counts = s.value_counts(dropna=False)
+    counts.index = [("Not specified" if (pd.isna(i)) else i) for i in counts.index]
+    counts = counts.groupby(level=0).sum()
+    if counts.sum() == 0:
+        return _empty_fig()
+    dfd = counts.reset_index()
+    dfd.columns = ["Response", "Count"]
+    pct_yes, _, _ = yes_fraction(df[col])
+    fig = px.pie(
+        dfd, names="Response", values="Count", hole=0.62,
+        color="Response", color_discrete_map=DONUT_COLORS,
+        title=YESNO_LABELS.get(col, col),
+    )
+    fig.update_traces(textinfo="percent", sort=False,
+                      hovertemplate="<b>%{label}</b><br>%{value} policies (%{percent})<extra></extra>")
+    center = "—" if (isinstance(pct_yes, float) and np.isnan(pct_yes)) else f"{pct_yes:.0f}%"
+    fig.add_annotation(text=f"<b>{center}</b><br><span style='font-size:11px'>Yes</span>",
+                       showarrow=False, font=dict(size=22, color=INK, family="Fraunces, serif"))
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=-0.08))
+    return _style(fig, height=330)
+
+
+def build_specialist_bar(long_df: pd.DataFrame) -> go.Figure:
+    if long_df.empty:
+        return _empty_fig("No specialist data")
+    g = long_df["Specialist"].value_counts().reset_index()
+    g.columns = ["Specialist", "Count"]
+    g = g.sort_values("Count")
+    fig = px.bar(
+        g, x="Count", y="Specialist", orientation="h",
+        color="Count", color_continuous_scale="Blues",
+        title="Required Specialist Types (mentions)",
+    )
+    fig.update_traces(hovertemplate="<b>%{y}</b><br>%{x} policies<extra></extra>")
+    fig.update_layout(yaxis_title="", coloraxis_showscale=False)
+    return _style(fig, height=max(330, 30 * len(g) + 110))
+
+
+def build_specialist_treemap(long_df: pd.DataFrame) -> go.Figure:
+    if long_df.empty:
+        return _empty_fig("No specialist data")
+    g = long_df["Specialist"].value_counts().reset_index()
+    g.columns = ["Specialist", "Count"]
+    fig = px.treemap(
+        g, path=[px.Constant("All Specialists"), "Specialist"], values="Count",
+        color="Count", color_continuous_scale="Viridis",
+        title="Specialist Mix (treemap)",
+    )
+    fig.update_traces(hovertemplate="<b>%{label}</b><br>%{value} policies<extra></extra>",
+                      marker=dict(line=dict(color=PAPER, width=2)))
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=56, l=8, r=8, b=8))
+    return _style(fig, height=400)
+
+
+def build_brand_specialist_sunburst(long_df: pd.DataFrame, top_n: int = 10) -> go.Figure:
+    if long_df.empty:
+        return _empty_fig("No specialist data")
+    top = long_df["Brand"].value_counts().head(top_n).index
+    d = long_df[long_df["Brand"].isin(top)]
+    g = d.groupby(["Brand", "Specialist"]).size().reset_index(name="Count")
+    if g.empty:
+        return _empty_fig("No specialist data")
+    fig = px.sunburst(
+        g, path=["Brand", "Specialist"], values="Count",
+        color="Count", color_continuous_scale="Tealgrn",
+        title=f"Brand → Specialist (top {len(top)} brands)",
+    )
+    fig.update_traces(hovertemplate="<b>%{label}</b><br>%{value} policies<extra></extra>")
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=56, l=8, r=8, b=8))
+    return _style(fig, height=420)
+
+
+def build_duration_hist(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Initial_Authorization_Duration_months"])
+    if d.empty:
+        return _empty_fig()
+    fig = px.histogram(
+        d, x="Initial_Authorization_Duration_months", nbins=18, marginal="rug",
+        color_discrete_sequence=[ACCENT], title="Initial Authorization Duration (months)",
+        labels={"Initial_Authorization_Duration_months": "Months"},
+    )
+    med = d["Initial_Authorization_Duration_months"].median()
+    fig.add_vline(x=med, line_dash="dash", line_color=ACCENT2,
+                  annotation_text=f"median {med:.0f} mo", annotation_position="top")
+    fig.update_layout(bargap=0.06, yaxis_title="Policies")
+    return _style(fig, height=380)
+
+
+def build_duration_box_by_brand(df: pd.DataFrame, top_n: int = 12) -> go.Figure:
+    d = df.dropna(subset=["Initial_Authorization_Duration_months"])
+    if d.empty:
+        return _empty_fig()
+    top = d["Brand"].value_counts().head(top_n).index
+    d = d[d["Brand"].isin(top)]
+    order = (d.groupby("Brand")["Initial_Authorization_Duration_months"]
+             .median().sort_values(ascending=False).index)
+    fig = px.box(
+        d, x="Brand", y="Initial_Authorization_Duration_months", color="Brand",
+        category_orders={"Brand": list(order)}, hover_data=["Filename"],
+        color_discrete_sequence=PALETTE,
+        title=f"Auth Duration by Brand (top {len(top)})",
+        labels={"Initial_Authorization_Duration_months": "Months"},
+    )
+    fig.update_layout(showlegend=False, xaxis_title="", xaxis_tickangle=-30)
+    return _style(fig, height=420)
+
+
+def build_duration_vs_score(df: pd.DataFrame) -> go.Figure:
+    d = df.dropna(subset=["Initial_Authorization_Duration_months", "Access Score"]).copy()
+    if d.empty:
+        return _empty_fig()
+    fig = px.scatter(
+        d, x="Initial_Authorization_Duration_months", y="Access Score",
+        color="Brand", custom_data=["Filename", "Brand"],
+        color_discrete_sequence=PALETTE,
+        title="Auth Duration vs Access Score",
+        labels={"Initial_Authorization_Duration_months": "Initial Auth (months)"},
+    )
+    fig.update_traces(marker=dict(size=10, line=dict(width=0.5, color="white")),
+                      hovertemplate=("<b>%{customdata[1]}</b> — %{customdata[0]}<br>"
+                                     "Duration: %{x} mo<br>Score: %{y:.1f}<extra></extra>"))
+    fig.update_layout(showlegend=False)
+    return _style(fig, height=420)
+
+
+def build_age_breakdown(df: pd.DataFrame) -> go.Figure:
+    s = df["Age"].dropna()
+    if s.empty:
+        return _empty_fig("No age data")
+    g = s.value_counts().reset_index()
+    g.columns = ["Age Restriction", "Count"]
+    g = g.sort_values("Count")
+    fig = px.bar(
+        g, x="Count", y="Age Restriction", orientation="h",
+        color="Count", color_continuous_scale="Blues",
+        title="Age Restrictions",
+    )
+    fig.update_traces(hovertemplate="<b>%{y}</b><br>%{x} policies<extra></extra>")
+    fig.update_layout(yaxis_title="", coloraxis_showscale=False)
+    return _style(fig, height=max(300, 34 * len(g) + 110))
+
+
+def build_corr_heatmap(df: pd.DataFrame) -> go.Figure:
+    cols = NUMERIC_COLS + ["Total_Steps"]
+    sub = df[cols].apply(pd.to_numeric, errors="coerce")
+    sub = sub.loc[:, sub.notna().sum() > 1]
+    sub = sub.loc[:, sub.std(numeric_only=True) > 0]
+    if sub.shape[1] < 2:
+        return _empty_fig("Not enough numeric variation for correlation")
+    corr = sub.corr()
+    nice = {
+        "Number_of_Steps_through_Generic": "Generic Steps",
+        "Number_of_Steps_through_Brands": "Brand Steps",
+        "Initial_Authorization_Duration_months": "Init. Auth (mo)",
+        "Access Score": "Access Score",
+        "Total_Steps": "Total Steps",
+    }
+    corr = corr.rename(index=nice, columns=nice)
+    fig = px.imshow(
+        corr, text_auto=".2f", aspect="auto", zmin=-1, zmax=1,
+        color_continuous_scale="RdBu_r", title="Correlation of Numeric Parameters",
+    )
+    fig.update_layout(coloraxis_colorbar=dict(title="r"))
+    return _style(fig, height=420)
+
+
+def build_parcats(df: pd.DataFrame) -> go.Figure:
+    dims = [c for c in YESNO_COLS if df[c].notna().any()]
+    if not dims:
+        return _empty_fig("No categorical requirement data")
+    d = df.copy()
+    for c in dims:
+        d[c] = d[c].where(d[c].isin(["Yes", "No"]), other="Not specified")
+    color_vals = pd.to_numeric(d["Access Score"], errors="coerce")
+    if color_vals.notna().any():
+        d["__color"] = color_vals.fillna(color_vals.median())
+    else:
+        d["__color"] = 0
+    dimensions = [go.parcats.Dimension(values=d[c], label=YESNO_LABELS.get(c, c)) for c in dims]
+    fig = go.Figure(
+        go.Parcats(
+            dimensions=dimensions,
+            line=dict(color=d["__color"], colorscale="Viridis",
+                      colorbar=dict(title="Access Score"), shape="hspline"),
+            hoveron="color", arrangement="freeform",
+        )
+    )
+    fig.update_layout(title="Requirement Combinations (flows colored by Access Score)")
+    return _style(fig, height=440)
+
+
+def build_completeness(df: pd.DataFrame) -> go.Figure:
+    cols = [c for c in EXPECTED_COLS]
+    pct = [(c, df[c].notna().mean() * 100) for c in cols]
+    g = pd.DataFrame(pct, columns=["Field", "Completeness"]).sort_values("Completeness")
+    fig = px.bar(
+        g, x="Completeness", y="Field", orientation="h",
+        color="Completeness", color_continuous_scale="Greens",
+        range_color=[0, 100], title="Field Completeness (% non-missing)",
+    )
+    fig.update_traces(hovertemplate="<b>%{y}</b><br>%{x:.0f}% populated<extra></extra>")
+    fig.update_layout(yaxis_title="", coloraxis_showscale=False, xaxis_ticksuffix="%")
+    return _style(fig, height=max(330, 26 * len(g) + 110))
+
+
+def build_radar(df: pd.DataFrame, brand: str) -> go.Figure:
+    bdf = df[df["Brand"] == brand]
+    if bdf.empty:
+        return _empty_fig("No rows for this brand")
+
+    def metrics(frame):
+        tb = yes_fraction(frame["TB_Test_required"])[0]
+        re_ = yes_fraction(frame["Reauthorization_Required"])[0]
+        ph = yes_fraction(frame["Step_through_Phototherapy"])[0]
+        ql = yes_fraction(frame["Quantity_Limits"])[0]
+        return {
+            "Access Score": safe_mean(frame["Access Score"]),
+            "Generic Steps": safe_mean(frame["Number_of_Steps_through_Generic"]),
+            "Brand Steps": safe_mean(frame["Number_of_Steps_through_Brands"]),
+            "Init. Auth (mo)": safe_mean(frame["Initial_Authorization_Duration_months"]),
+            "TB Test": tb, "Reauth": re_, "Phototherapy": ph, "Qty Limits": ql,
+        }
+
+    cats = ["Access Score", "Generic Steps", "Brand Steps", "Init. Auth (mo)",
+            "TB Test", "Reauth", "Phototherapy", "Qty Limits"]
+
+    def _den(series) -> float:
+        s = pd.to_numeric(series, errors="coerce")
+        m = s.max()
+        return float(m) if pd.notna(m) and m > 0 else 1.0
+
+    denom = {
+        "Access Score": _den(df["Access Score"]),
+        "Generic Steps": _den(df["Number_of_Steps_through_Generic"]),
+        "Brand Steps": _den(df["Number_of_Steps_through_Brands"]),
+        "Init. Auth (mo)": _den(df["Initial_Authorization_Duration_months"]),
+        "TB Test": 100, "Reauth": 100, "Phototherapy": 100, "Qty Limits": 100,
+    }
+
+    def norm(vals):
+        out = []
+        for c in cats:
+            v = vals[c]
+            v = 0 if (v is None or (isinstance(v, float) and np.isnan(v))) else v
+            out.append(min(v / denom[c], 1.0) if denom[c] else 0)
+        return out
+
+    bm, om = metrics(bdf), metrics(df)
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=norm(om) + [norm(om)[0]], theta=cats + [cats[0]],
+                                  fill="toself", name="All brands (filtered)",
+                                  line=dict(color="#BCb3A0"), fillcolor="rgba(188,179,160,.25)"))
+    fig.add_trace(go.Scatterpolar(r=norm(bm) + [norm(bm)[0]], theta=cats + [cats[0]],
+                                  fill="toself", name=brand,
+                                  line=dict(color=ACCENT), fillcolor="rgba(15,118,110,.25)"))
+    fig.update_layout(
+        title=f"Restrictiveness Fingerprint — {brand}",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False,
+                                   gridcolor=GRID), angularaxis=dict(gridcolor=GRID)),
+        legend=dict(orientation="h", y=-0.08),
+    )
+    return _style(fig, height=440)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def section(eyebrow: str, title: str, desc: str = "") -> None:
+    st.markdown(
+        f"""<div class='macc-section'>
+        <div class='macc-eyebrow'>{eyebrow}</div>
+        <h2>{title}</h2>
+        <div class='desc'>{desc}</div>
+        <div class='macc-rule'></div></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def caption(text: str) -> None:
+    st.markdown(f"<div class='macc-caption'>{text}</div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main app
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config(
+        page_title="Market Access Dashboard — PA Pipeline",
+        page_icon="🧬", layout="wide", initial_sidebar_state="expanded",
+    )
+    st.markdown(CSS, unsafe_allow_html=True)
+    install_plotly_theme()
+
+    # ---- Top: data upload (CSV or Excel) ------------------------------------
+    st.markdown(
+        "<div class='macc-eyebrow' style='margin-bottom:6px'>Data Source</div>",
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        up_l, up_r = st.columns([3, 1])
+        with up_l:
+            uploaded = st.file_uploader(
+                "Upload your prior-authorization results — CSV or Excel",
+                type=["csv", "xlsx", "xlsm", "xls"],
+                help="Drag a .csv or .xlsx file here, or click Browse. "
+                     "This replaces the need to swap the file in the backend.",
+            )
+        with up_r:
+            st.markdown(
+                f"<div style='color:{SUBTLE};font-size:.82rem;padding-top:.4rem'>"
+                "Accepted: <b>.csv</b>, <b>.xlsx</b>, <b>.xls</b>.<br>"
+                "If nothing is uploaded, a local <code>result.csv</code>/"
+                "<code>.xlsx</code> is used automatically.</div>",
+                unsafe_allow_html=True,
+            )
+
+    try:
+        if uploaded is not None:
+            df_all = load_and_clean_from_bytes(uploaded.getvalue(), uploaded.name)
+            source_kind, source_msg = "success", f"Loaded **{uploaded.name}** — {len(df_all):,} rows."
+        else:
+            local = find_local_data()
+            if local is None:
+                raise FileNotFoundError
+            df_all = load_and_clean_from_path(local)
+            source_kind = "info"
+            source_msg = f"Using local **{local}** — {len(df_all):,} rows. Upload a file above to override."
+    except FileNotFoundError:
+        st.info(
+            "⬆️ Upload a **CSV** or **Excel** file above to get started "
+            "(no local `result.csv` / `result.xlsx` was found in the working directory)."
+        )
+        st.stop()
+    except ImportError as e:  # missing Excel engine
+        st.error(str(e))
+        st.stop()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not read the file: {e}")
+        st.stop()
+
+    getattr(st, source_kind)(source_msg)
+
+    # ---- Hero ---------------------------------------------------------------
+    st.markdown(
+        f"""<div class='macc-hero'>
+            <div class='macc-eyebrow'>Prior Authorization · Plaque Psoriasis</div>
+            <h1>Market Access Dashboard</h1>
+            <div class='sub'>An exhaustive, interactive view of payer prior-authorization
+            requirements extracted by the PA pipeline — access scores, step-therapy friction,
+            specialist gating, safety screening, and authorization durations across brands.</div>
+            <div class='macc-tags'>
+                <span class='macc-tag'>{df_all['Filename'].nunique():,} policies</span>
+                <span class='macc-tag'>{df_all['Brand'].nunique():,} brands</span>
+                <span class='macc-tag'>12 PA parameters</span>
+                <span class='macc-tag'>NA-safe numeric coercion</span>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ---- Sidebar: filters ----------------------------------------------------
+    st.sidebar.markdown("### 🎛️ Filters")
+
+    brands = sorted([b for b in df_all["Brand"].dropna().unique()])
+    sel_brands = st.sidebar.multiselect("Brand", brands, default=[],
+                                        key="flt_brands", help="Empty = all brands")
+
+    all_specs = sorted(specialist_long(df_all)["Specialist"].dropna().unique().tolist())
+    sel_specs = st.sidebar.multiselect("Specialist type", all_specs, default=[],
+                                       key="flt_specs",
+                                       help="Empty = all. Keeps policies mentioning any selected specialist.")
+
+    score_series = df_all["Access Score"].dropna()
+    if not score_series.empty:
+        s_min, s_max = float(score_series.min()), float(score_series.max())
+        if s_min == s_max:
+            s_max = s_min + 1.0
+        sel_score = st.sidebar.slider("Access Score range", s_min, s_max, (s_min, s_max),
+                                      key="flt_score")
+    else:
+        sel_score = None
+
+    def flag_filter(label, col):
+        return st.sidebar.selectbox(label, ["All", "Yes", "No"], index=0, key=f"flt_{col}")
+
+    f_tb = flag_filter("TB test required", "TB_Test_required")
+    f_re = flag_filter("Reauthorization required", "Reauthorization_Required")
+    f_ph = flag_filter("Phototherapy step", "Step_through_Phototherapy")
+    f_ql = flag_filter("Quantity limits", "Quantity_Limits")
+
+    st.sidebar.markdown("---")
+    top_n = st.sidebar.slider("Max brands in per-brand charts", 5, 30, 12)
+    if st.sidebar.button("↺ Reset filters", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            if k.startswith("flt_"):
+                del st.session_state[k]
+        st.rerun()
+
+    # ---- Apply filters -------------------------------------------------------
+    df = df_all.copy()
+    if sel_brands:
+        df = df[df["Brand"].isin(sel_brands)]
+    if sel_specs:
+        sel_set = set(sel_specs)
+        mask = df["Specialist_Types"].map(lambda v: bool(set(row_specialists(v)) & sel_set))
+        df = df[mask]
+    if sel_score is not None:
+        in_range = df["Access Score"].between(sel_score[0], sel_score[1])
+        df = df[in_range | df["Access Score"].isna()]
+    for col, choice in [("TB_Test_required", f_tb), ("Reauthorization_Required", f_re),
+                        ("Step_through_Phototherapy", f_ph), ("Quantity_Limits", f_ql)]:
+        if choice != "All":
+            df = df[df[col] == choice]
+
+    if df.empty:
+        st.warning("No policies match the current filters. Widen your selection in the sidebar.")
+        st.stop()
+
+    st.sidebar.markdown(
+        f"<div style='font-family:{FONT_MONO};font-size:.8rem;color:{SUBTLE}'>"
+        f"Showing <b>{len(df):,}</b> of {len(df_all):,} policies</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- Row 1: Executive KPIs ----------------------------------------------
+    section("01 · Overview", "Executive Summary",
+            "Headline metrics for the current selection. Deltas compare the filtered "
+            "selection against the full dataset average.")
+
+    o_score, o_med = safe_mean(df_all["Access Score"]), safe_median(df_all["Access Score"])
+    o_gen, o_brd = safe_mean(df_all["Number_of_Steps_through_Generic"]), safe_mean(df_all["Number_of_Steps_through_Brands"])
+    o_tb = yes_fraction(df_all["TB_Test_required"])[0]
+    o_re = yes_fraction(df_all["Reauthorization_Required"])[0]
+
+    f_score, f_med = safe_mean(df["Access Score"]), safe_median(df["Access Score"])
+    f_gen, f_brd = safe_mean(df["Number_of_Steps_through_Generic"]), safe_mean(df["Number_of_Steps_through_Brands"])
+    f_tb_pct = yes_fraction(df["TB_Test_required"])[0]
+    f_re_pct = yes_fraction(df["Reauthorization_Required"])[0]
+    f_dur = safe_mean(df["Initial_Authorization_Duration_months"])
+
+    r1 = st.columns(4)
+    r1[0].metric("Policies in view", f"{len(df):,}")
+    r1[1].metric("Unique brands", f"{df['Brand'].nunique():,}")
+    r1[2].metric("Avg Access Score", fmt_num(f_score, 1),
+                 delta=delta_str(f_score, o_score), delta_color="off")
+    r1[3].metric("Median Access Score", fmt_num(f_med, 1),
+                 delta=delta_str(f_med, o_med), delta_color="off")
+
+    r2 = st.columns(4)
+    r2[0].metric("Avg Generic Steps", fmt_num(f_gen, 1),
+                 delta=delta_str(f_gen, o_gen), delta_color="off")
+    r2[1].metric("Avg Brand Steps", fmt_num(f_brd, 1),
+                 delta=delta_str(f_brd, o_brd), delta_color="off")
+    r2[2].metric("TB Test Required", fmt_pct(f_tb_pct),
+                 delta=delta_str(f_tb_pct, o_tb, pct=True), delta_color="off")
+    r2[3].metric("Reauth Required", fmt_pct(f_re_pct),
+                 delta=delta_str(f_re_pct, o_re, pct=True), delta_color="off")
+
+    # ---- Row 2: Access Score landscape --------------------------------------
+    section("02 · Access Score", "The Access Score Landscape",
+            "Which brands face the steepest access barriers, and how scores are distributed.")
+    c = st.columns([1.15, 1])
+    with c[0]:
+        st.plotly_chart(build_score_by_brand(df), use_container_width=True)
+    with c[1]:
+        st.plotly_chart(build_score_distribution(df), use_container_width=True)
+    st.plotly_chart(build_score_box_by_brand(df, top_n), use_container_width=True)
+    caption("Box plots show median, IQR and individual policies (jittered) per brand.")
+
+    # ---- Row 3: Step-therapy friction ---------------------------------------
+    section("03 · Step Therapy", "Step-Therapy Friction",
+            "How many generic and branded agents a patient must fail before approval.")
+    c = st.columns(2)
+    with c[0]:
+        st.plotly_chart(build_friction_scatter(df), use_container_width=True)
+        caption("Bubble size = total required steps · color = Access Score. Points jittered to reduce overlap.")
+    with c[1]:
+        st.plotly_chart(build_friction_density(df), use_container_width=True)
+        caption("Counts of policies at each (generic, brand) step combination.")
+    st.plotly_chart(build_steps_by_brand(df, top_n), use_container_width=True)
+
+    # ---- Row 4: Requirements (donuts) ---------------------------------------
+    section("04 · Requirements", "Clinical & Administrative Gates",
+            "Share of policies imposing each categorical requirement (NA shown as 'Not specified').")
+    c = st.columns(4)
+    for col, container in zip(YESNO_COLS, c):
+        with container:
+            st.plotly_chart(build_requirement_donut(df, col), use_container_width=True)
+
+    # ---- Row 5: Specialist requirements -------------------------------------
+    section("05 · Specialists", "Who Can Prescribe",
+            "Specialist gating extracted from the policy text (multi-valued cells are split).")
+    long_df = specialist_long(df)
+    c = st.columns([1, 1])
+    with c[0]:
+        st.plotly_chart(build_specialist_bar(long_df), use_container_width=True)
+    with c[1]:
+        st.plotly_chart(build_specialist_treemap(long_df), use_container_width=True)
+    st.plotly_chart(build_brand_specialist_sunburst(long_df, top_n), use_container_width=True)
+
+    # ---- Row 6: Duration & Age ----------------------------------------------
+    section("06 · Duration & Age", "Authorization Windows & Age Limits",
+            "How long initial approvals last, and the age restrictions encoded in policy.")
+    c = st.columns(2)
+    with c[0]:
+        st.plotly_chart(build_duration_hist(df), use_container_width=True)
+    with c[1]:
+        st.plotly_chart(build_age_breakdown(df), use_container_width=True)
+    c = st.columns(2)
+    with c[0]:
+        st.plotly_chart(build_duration_box_by_brand(df, top_n), use_container_width=True)
+    with c[1]:
+        st.plotly_chart(build_duration_vs_score(df), use_container_width=True)
+
+    # ---- Row 7: Multivariate ------------------------------------------------
+    section("07 · Multivariate", "Cross-Parameter Patterns",
+            "Correlations between numeric parameters and how requirement combinations co-occur.")
+    c = st.columns([1, 1.25])
+    with c[0]:
+        st.plotly_chart(build_corr_heatmap(df), use_container_width=True)
+    with c[1]:
+        st.plotly_chart(build_parcats(df), use_container_width=True)
+
+    # ---- Brand drill-down ----------------------------------------------------
+    section("08 · Drill-down", "Brand Fingerprint",
+            "Compare a single brand's restrictiveness profile against the filtered cohort.")
+    drill_brands = sorted(df["Brand"].dropna().unique().tolist())
+    if drill_brands:
+        dcols = st.columns([1, 2])
+        with dcols[0]:
+            pick = st.selectbox("Select a brand", drill_brands)
+            bsub = df[df["Brand"] == pick]
+            st.metric("Policies", f"{len(bsub):,}")
+            st.metric("Avg Access Score", fmt_num(safe_mean(bsub["Access Score"]), 1))
+            st.metric("Avg Total Steps", fmt_num(safe_mean(bsub["Total_Steps"]), 1))
+            st.metric("Avg Init. Auth (mo)", fmt_num(safe_mean(bsub["Initial_Authorization_Duration_months"]), 1))
+        with dcols[1]:
+            st.plotly_chart(build_radar(df, pick), use_container_width=True)
+
+    # ---- Data quality & raw table -------------------------------------------
+    section("09 · Appendix", "Data Quality & Records", "")
+    with st.expander("📐 Field completeness", expanded=False):
+        st.plotly_chart(build_completeness(df), use_container_width=True)
+
+    with st.expander("🗂️ Filtered records", expanded=False):
+        show = df.drop(columns=[c for c in ["Total_Steps"] if c in df.columns]).reset_index(drop=True)
+        st.dataframe(show, use_container_width=True, height=420)
+        st.download_button(
+            "⬇️ Download filtered CSV",
+            data=show.to_csv(index=False).encode("utf-8"),
+            file_name="market_access_filtered.csv", mime="text/csv",
+            use_container_width=True,
+        )
+
+    with st.expander("ℹ️ Methodology & column notes", expanded=False):
+        st.markdown(
+            """
+**Cleaning.** Every `NA`-like token (`NA`, `N/A`, `none`, blank, `-`, …) is converted to a real
+`NaN`. Numeric columns — *Number_of_Steps_through_Generic*, *Number_of_Steps_through_Brands*,
+*Initial_Authorization_Duration_months*, *Access Score* — are coerced with
+`pd.to_numeric(errors="coerce")`. Yes/No flag columns are normalized to `{Yes, No, NaN}`.
+
+**Percentages.** Requirement percentages (e.g. *TB Test Required*) are computed over policies with a
+non-missing Yes/No response; *Not specified* slices in the donuts represent missing data.
+
+**Specialists.** *Specialist_Types* cells may list several specialties; they are split on commas,
+semicolons, slashes and the words *and*/*or* before counting.
+
+**Deltas.** KPI deltas compare the current filtered selection against the full-dataset average and are
+shown in a neutral color — they describe difference, not "good" or "bad."
+            """
+        )
+    st.markdown(
+        f"<div style='text-align:center;color:{SUBTLE};font-family:{FONT_MONO};"
+        f"font-size:.75rem;margin-top:28px'>Market Access Dashboard · built with Streamlit + Plotly</div>",
+        unsafe_allow_html=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
