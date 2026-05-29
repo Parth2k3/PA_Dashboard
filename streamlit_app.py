@@ -1147,12 +1147,10 @@ def main() -> None:
     with c[1]:
         st.plotly_chart(build_duration_vs_score(df), use_container_width=True, key="dur_vs_score")
 
-    section("07 · Multivariate", "Cross-Parameter Patterns", "Correlations between numeric parameters and how requirement combinations co-occur.")
+    section("07 · Multivariate", "Cross-Parameter Patterns", "Correlations between numeric parameters.")
     c = st.columns([1, 1.25])
     with c[0]:
         st.plotly_chart(build_corr_heatmap(df), use_container_width=True, key="corr_heatmap")
-    with c[1]:
-        st.plotly_chart(build_parcats(df), use_container_width=True, key="parcats")
 
     section("08 · Drill-down", "Brand Fingerprint", "Compare a single brand's restrictiveness profile against the filtered cohort.")
     drill_brands = sorted(df["Brand"].dropna().unique().tolist())
